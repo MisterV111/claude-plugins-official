@@ -18,10 +18,11 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { randomBytes, randomUUID } from 'crypto'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, watch, fsyncSync, openSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { execSync } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -51,22 +52,91 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const INBOX_MESSAGES_DIR = join(INBOX_DIR, 'messages')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+const PENDING_PERMS_FILE = join(STATE_DIR, 'pending-permissions.json')
+// Shim consumer lock (2026-04-20). Cursor's extension-host auto-spawns phantom
+// telegram plugin instances that bypass `channelsEnabled:false` (they launch
+// `bun run` directly, not via `claude`). Without this lock they'd race Juan's
+// real cct shim for envelopes; winner unlinks the file, loser's dispatch fails.
+// Last-writer-wins: newest shim claims on startup, older shims yield on
+// dispatch. Stale PIDs auto-recovered.
+const SHIM_LOCK_FILE = join(STATE_DIR, 'shim.lock')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// Bridge architecture (2026-04-20): plugin runs in three modes.
+//   daemon  — spawned with --daemon by launchd; owns bot.start() polling,
+//             writes inbound envelopes to INBOX_MESSAGES_DIR, no MCP.
+//   shim    — spawned by cct; bot.pid has "daemon:<pid>" marker and that pid
+//             is alive; skips bot.start(), runs MCP + fs.watch on inbox.
+//   legacy  — spawned by cct; no live daemon; owns bot.start() AND MCP (today's
+//             behavior). Rollback is "launchctl unload" — shim detects dead
+//             daemon and falls through here.
+type Mode = 'daemon' | 'shim' | 'legacy'
+
+const IS_DAEMON_FLAG = process.argv.includes('--daemon')
+
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+
+function detectCctMode(): { mode: 'shim' | 'legacy'; daemonPid?: number } {
+  try {
+    const raw = readFileSync(PID_FILE, 'utf8').trim()
+    const m = raw.match(/^daemon:(\d+)$/)
+    if (m) {
+      const pid = parseInt(m[1]!, 10)
+      try {
+        process.kill(pid, 0)
+        return { mode: 'shim', daemonPid: pid }
+      } catch { /* daemon dead, fall through to legacy */ }
+    }
+  } catch { /* no PID file — fresh boot or rolled back */ }
+  return { mode: 'legacy' }
+}
+
+let MODE: Mode
+let daemonPid: number | undefined
+
+if (IS_DAEMON_FLAG) {
+  MODE = 'daemon'
+  // Daemon owns bot.pid. Evict any pre-existing holder (legacy, stale, or
+  // prior daemon). Accept both "daemon:<pid>" and bare "<pid>" formats.
+  try {
+    const raw = readFileSync(PID_FILE, 'utf8').trim()
+    const m = raw.match(/^(?:daemon:)?(\d+)$/)
+    if (m) {
+      const stale = parseInt(m[1]!, 10)
+      if (stale > 1 && stale !== process.pid) {
+        try {
+          process.kill(stale, 0)
+          process.stderr.write(`telegram channel (daemon): evicting existing poller pid=${stale}\n`)
+          process.kill(stale, 'SIGTERM')
+        } catch {}
+      }
+    }
+  } catch {}
+  writeFileSync(PID_FILE, `daemon:${process.pid}`)
+} else {
+  const det = detectCctMode()
+  MODE = det.mode
+  daemonPid = det.daemonPid
+  if (MODE === 'legacy') {
+    // Preserve today's takeover logic byte-for-byte on the legacy path. If
+    // bot.pid somehow still carries a "daemon:<pid>" marker for a dead PID,
+    // parseInt stops at the colon → NaN → skipped, which is correct (that
+    // dead daemon can't be SIGTERMed).
+    try {
+      const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+      if (stale > 1 && stale !== process.pid) {
+        process.kill(stale, 0)
+        process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+        process.kill(stale, 'SIGTERM')
+      }
+    } catch {}
+    writeFileSync(PID_FILE, String(process.pid))
   }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+  // MODE === 'shim': daemon owns the PID file; don't touch it.
+}
+
+process.stderr.write(`telegram channel: mode=${MODE}${daemonPid ? ` (daemon pid=${daemonPid})` : ''}\n`)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -336,7 +406,8 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+// Shim doesn't run the bot side — daemon handles pairing confirmations.
+if (!STATIC && MODE !== 'shim') setInterval(checkApprovals, 5000).unref()
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -365,6 +436,91 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+
+// ──────────────────────────────────────────────────────────────────────────
+// Bridge helpers — envelope IO + pending-permission state sharing.
+// ──────────────────────────────────────────────────────────────────────────
+
+type Envelope =
+  | { v: 1; kind: 'channel'; ts: number; content: string; meta: Record<string, string> }
+  | { v: 1; kind: 'permission'; ts: number; request_id: string; behavior: 'allow' | 'deny' }
+
+// Atomic-rename contract: write to `.tmp-<id>`, fsync, rename to `<id>.json`.
+// Shim's fs.watch filters on `.json` suffix so mid-write temp files never
+// get consumed.
+function writeInboxEnvelope(payload: Envelope): void {
+  mkdirSync(INBOX_MESSAGES_DIR, { recursive: true, mode: 0o700 })
+  const id = `${Date.now()}-${randomUUID()}`
+  const tmpPath = join(INBOX_MESSAGES_DIR, `.tmp-${id}`)
+  const finalPath = join(INBOX_MESSAGES_DIR, `${id}.json`)
+  writeFileSync(tmpPath, JSON.stringify(payload))
+  const fd = openSync(tmpPath, 'r')
+  try { fsyncSync(fd) } finally { closeSync(fd) }
+  renameSync(tmpPath, finalPath)
+}
+
+// In daemon mode: serialize to inbox for shim to pick up.
+// In legacy mode: same process owns MCP; emit directly.
+// Shim itself never reaches these (it has no bot handlers running).
+function emitChannel(content: string, meta: Record<string, string>): void {
+  if (MODE === 'daemon') {
+    try {
+      writeInboxEnvelope({ v: 1, kind: 'channel', ts: Date.now(), content, meta })
+    } catch (err) {
+      process.stderr.write(`telegram channel (daemon): inbox write failed: ${err}\n`)
+    }
+    return
+  }
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content, meta },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+}
+
+function emitPermission(request_id: string, behavior: 'allow' | 'deny'): void {
+  if (MODE === 'daemon') {
+    try {
+      writeInboxEnvelope({ v: 1, kind: 'permission', ts: Date.now(), request_id, behavior })
+    } catch (err) {
+      process.stderr.write(`telegram channel (daemon): permission envelope write failed: ${err}\n`)
+    }
+    return
+  }
+  void mcp.notification({
+    method: 'notifications/claude/channel/permission',
+    params: { request_id, behavior },
+  })
+}
+
+// Pending-permission details (from CC's permission_request notification) live
+// in shim memory. Daemon needs them to render the "See more" button expansion.
+// Shim persists the Map to disk on every mutation; daemon reads on demand.
+// File is overwritten atomically (.tmp rename) so readers never see partials.
+type PendingPermissionDetail = { tool_name: string; description: string; input_preview: string }
+
+function persistPendingPermissions(map: Map<string, PendingPermissionDetail>): void {
+  const obj: Record<string, PendingPermissionDetail> = {}
+  for (const [k, v] of map) obj[k] = v
+  try {
+    const tmp = PENDING_PERMS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 })
+    renameSync(tmp, PENDING_PERMS_FILE)
+  } catch (err) {
+    process.stderr.write(`telegram channel: pending-permissions persist failed: ${err}\n`)
+  }
+}
+
+function loadPendingPermissionsFromDisk(): Map<string, PendingPermissionDetail> {
+  try {
+    const raw = readFileSync(PENDING_PERMS_FILE, 'utf8')
+    const obj = JSON.parse(raw) as Record<string, PendingPermissionDetail>
+    return new Map(Object.entries(obj))
+  } catch {
+    return new Map()
+  }
+}
 
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
@@ -415,6 +571,8 @@ mcp.setNotificationHandler(
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    // Daemon reads this file on "See more" clicks to render expanded view.
+    persistPendingPermissions(pendingPermissions)
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
     const keyboard = new InlineKeyboard()
@@ -627,7 +785,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
+// Daemon has no MCP parent; it owns the bot and writes envelopes to disk.
+if (MODE !== 'daemon') {
+  await mcp.connect(new StdioServerTransport())
+}
+
+// Shim: drain any envelopes written while this cct session wasn't watching,
+// then subscribe to new ones. Handlers dispatch through the same mcp instance
+// cct is already connected to.
+if (MODE === 'shim') {
+  runShim()
+}
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
@@ -636,32 +804,63 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('telegram channel: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
+  process.stderr.write(`telegram channel: shutting down (mode=${MODE})\n`)
+  // Release bot.pid only if WE own it. Daemon and legacy each write their own
+  // format; shim never touches it.
+  if (MODE === 'daemon') {
+    try {
+      const raw = readFileSync(PID_FILE, 'utf8').trim()
+      const m = raw.match(/^daemon:(\d+)$/)
+      if (m && parseInt(m[1]!, 10) === process.pid) rmSync(PID_FILE)
+    } catch {}
+  } else if (MODE === 'legacy') {
+    try {
+      if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    } catch {}
+  }
+  if (MODE === 'shim') {
+    // Release the consumer lock only if we still hold it. A newer shim may
+    // have claimed it — removing their PID would leave no owner and the next
+    // envelope read by any shim would claim on stale-check anyway, but it's
+    // cleaner to leave the live successor's PID in place.
+    try {
+      const holder = parseInt(readFileSync(SHIM_LOCK_FILE, 'utf8'), 10)
+      if (holder === process.pid) rmSync(SHIM_LOCK_FILE, { force: true })
+    } catch {}
+    // No bot.start() was called — nothing to gracefully stop.
+    process.exit(0)
+    return
+  }
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+// SIGTERM/SIGINT/SIGHUP are live in every mode — launchctl unload sends
+// SIGTERM to the daemon, Ctrl-C sends SIGINT, etc.
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
-}, 5000).unref()
+// Daemon runs under launchd with no stdin parent; listening for stdin
+// EOF/orphan signals would pin MODE === 'daemon' into an instant shutdown
+// loop because launchd sets stdin to /dev/null.
+if (MODE !== 'daemon') {
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
+
+  // Orphan watchdog: stdin events above don't reliably fire when the parent
+  // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
+  // reparenting (POSIX) or a dead stdin pipe and self-terminate.
+  const bootPpid = process.ppid
+  setInterval(() => {
+    const orphaned =
+      (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+      process.stdin.destroyed ||
+      process.stdin.readableEnded
+    if (orphaned) shutdown()
+  }, 5000).unref()
+}
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
@@ -738,7 +937,12 @@ bot.on('callback_query:data', async ctx => {
   const [, behavior, request_id] = m
 
   if (behavior === 'more') {
-    const details = pendingPermissions.get(request_id)
+    // Daemon doesn't hold pendingPermissions in memory (no MCP handler); it
+    // reads the disk snapshot shim persists on each permission_request.
+    // Legacy keeps in-memory map (daemon and shim are the same process).
+    const details = MODE === 'daemon'
+      ? loadPendingPermissionsFromDisk().get(request_id)
+      : pendingPermissions.get(request_id)
     if (!details) {
       await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
       return
@@ -763,10 +967,7 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
-  })
+  emitPermission(request_id, behavior as 'allow' | 'deny')
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
@@ -920,13 +1121,10 @@ async function handleInbound(
   // (non-allowlisted senders were dropped above), so we trust the reply.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
-    void mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
-      },
-    })
+    emitPermission(
+      permMatch[2]!.toLowerCase(),
+      permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+    )
     if (msgId != null) {
       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
       void bot.api.setMessageReaction(chat_id, msgId, [
@@ -954,29 +1152,22 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  const meta: Record<string, string> = {
+    chat_id,
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    user: from.username ?? String(from.id),
+    user_id: String(from.id),
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    ...(imagePath ? { image_path: imagePath } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+  }
+  emitChannel(text, meta)
 }
 
 // Without this, any throw in a message handler stops polling permanently
@@ -985,12 +1176,204 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
+// Shim mode outsources polling to the daemon — this plugin instance just
+// watches the inbox directory and dispatches envelopes into MCP. Daemon and
+// legacy modes run the polling loop below.
+//
+// Phantom detection: Cursor's extension-host spawns `bun run start` directly
+// from cached plugin metadata, with no `claude --channels` ancestor. Those
+// phantom shims have no real MCP client to deliver to — if they consume
+// envelopes they go to /dev/null. Walk the parent chain on startup and mark
+// the shim as phantom if no `claude` process with `--channels` is found; then
+// runShim becomes a no-op.
+function isLegitCctShim(): boolean {
+  let cur = process.ppid
+  for (let depth = 0; depth < 8 && cur > 1; depth++) {
+    let cmd: string
+    try {
+      // `ps -o command=` returns the argv-joined command line; reliable across macOS.
+      cmd = execSync(`ps -o command= -p ${cur}`, { encoding: 'utf8' }).trim()
+    } catch {
+      return false
+    }
+    // The cct invocation is `claude … --channels plugin:telegram@...`. The bun
+    // parent wrappers (`bun run --cwd …`) don't include --channels, so this
+    // reliably distinguishes legit cct from phantom bun-only chains.
+    if (/\bclaude\b/.test(cmd) && /--channels/.test(cmd)) return true
+    try {
+      const ppid = execSync(`ps -o ppid= -p ${cur}`, { encoding: 'utf8' }).trim()
+      const next = parseInt(ppid, 10)
+      if (!Number.isFinite(next) || next <= 1) return false
+      cur = next
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+// Claim the single-consumer lock. Among legit shims, last-writer-wins so the
+// newest cct session receives messages (matches user intent: latest is active).
+function claimShimConsumer(): void {
+  writeFileSync(SHIM_LOCK_FILE, String(process.pid), { mode: 0o600 })
+}
+
+// Called on every dispatch. Returns true iff we're the current consumer or
+// the previous one is dead (in which case we claim). If another live shim
+// holds the lock, yield — they'll handle this envelope.
+function isShimConsumer(): boolean {
+  let pid: number
+  try {
+    pid = parseInt(readFileSync(SHIM_LOCK_FILE, 'utf8'), 10)
+  } catch {
+    // No lock file — claim it (first shim up after daemon launch).
+    claimShimConsumer()
+    return true
+  }
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return false // another live shim owns it
+  } catch {
+    // Stale lock — holder died without cleanup. Claim it.
+    claimShimConsumer()
+    return true
+  }
+}
+
+function runShim(): void {
+  mkdirSync(INBOX_MESSAGES_DIR, { recursive: true, mode: 0o700 })
+
+  // Phantom shim (spawned by Cursor extension-host with no cct ancestor) —
+  // don't touch the lock, don't watch, don't dispatch. We still keep MCP
+  // stdio connected so the phantom parent doesn't see an abrupt disconnect,
+  // but any envelope activity goes to the real cct shim.
+  if (!isLegitCctShim()) {
+    process.stderr.write(
+      `telegram channel (shim): no cct ancestor detected — phantom shim, skipping inbox watch (pid=${process.pid})\n`,
+    )
+    return
+  }
+
+  // Newest legit shim becomes the consumer. Older shims see the PID change on
+  // their next dispatch and yield — no explicit signal needed.
+  claimShimConsumer()
+
+  // Drain existing envelopes — but not until MCP handshake completes. If we
+  // fire `mcp.notification()` before cct has sent `notifications/initialized`,
+  // the client drops them on the floor (confirmed empirically 2026-04-20) and
+  // we'd unlink files thinking delivery succeeded. `oninitialized` fires
+  // exactly once after the handshake, so this gates drain safely.
+  const DEBUG_LOG = join(STATE_DIR, 'shim-debug.log')
+  const dlog = (msg: string): void => {
+    try {
+      writeFileSync(DEBUG_LOG, `${new Date().toISOString()} pid=${process.pid} ${msg}\n`, { flag: 'a' })
+    } catch {}
+  }
+  dlog(`runShim: entered, legit=true, about to claim lock`)
+
+  let drained = false
+  const drainExisting = (): void => {
+    if (drained) return
+    drained = true
+    dlog(`oninitialized fired — starting drain`)
+    try {
+      const existing = readdirSync(INBOX_MESSAGES_DIR)
+        .filter(f => f.endsWith('.json') && !f.startsWith('.tmp-'))
+        .sort() // lexical sort ≈ time order via `<timestamp>-<uuid>.json` naming
+      dlog(`drain found ${existing.length} envelope(s): ${existing.join(', ')}`)
+      for (const f of existing) void dispatch(f)
+    } catch (err) {
+      dlog(`drain readdir failed: ${err}`)
+    }
+  }
+  mcp.oninitialized = drainExisting
+  dlog(`oninitialized handler registered`)
+
+  async function dispatch(filename: string): Promise<void> {
+    // fs.watch surfaces temp files mid-write; atomic-rename contract says
+    // only `<id>.json` is committed. Anything else (.tmp-*, .claimed) is
+    // either in-flight or left over from a crashed shim — ignore.
+    if (!filename.endsWith('.json')) return
+    if (filename.startsWith('.tmp-')) return
+    // Only the current consumer processes envelopes. Phantom shims (e.g.
+    // Cursor extension-host auto-spawns) see this and return without touching
+    // the file, so the real cct's shim gets clean delivery.
+    if (!isShimConsumer()) return
+    const filepath = join(INBOX_MESSAGES_DIR, filename)
+    let raw: string
+    try {
+      raw = readFileSync(filepath, 'utf8')
+    } catch {
+      // Another shim instance (or the same one racing fs.watch events)
+      // already consumed it. Safe to drop.
+      return
+    }
+    let env: Envelope
+    try {
+      env = JSON.parse(raw) as Envelope
+    } catch (err) {
+      process.stderr.write(`telegram channel (shim): malformed envelope ${filename}: ${err}\n`)
+      try { rmSync(filepath, { force: true }) } catch {}
+      return
+    }
+    try {
+      if (env.kind === 'channel') {
+        dlog(`dispatch: about to send channel notification for ${filename}`)
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: { content: env.content, meta: env.meta },
+        })
+        dlog(`dispatch: channel notification sent for ${filename}`)
+      } else if (env.kind === 'permission') {
+        await mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: { request_id: env.request_id, behavior: env.behavior },
+        })
+        pendingPermissions.delete(env.request_id)
+        persistPendingPermissions(pendingPermissions)
+      } else {
+        process.stderr.write(`telegram channel (shim): unknown envelope kind in ${filename}\n`)
+      }
+    } catch (err) {
+      // Keep the envelope on disk for retry on next cct restart — don't lose
+      // messages because MCP notification transiently failed.
+      process.stderr.write(`telegram channel (shim): emit failed for ${filename}, keeping on disk: ${err}\n`)
+      dlog(`dispatch: ERROR ${filename}: ${err}`)
+      return
+    }
+    try { rmSync(filepath, { force: true }) } catch {}
+  }
+
+  // Drain happens in `oninitialized` above (fires after MCP handshake). If we
+  // drained here synchronously, notifications would go to a not-yet-ready cct
+  // client and be silently dropped.
+  //
+  // Edge case: `oninitialized` is already scheduled by the time the file is
+  // parsed, but the handshake might race our fs.watch setup below. That's
+  // fine — a new envelope arriving during the handshake window triggers
+  // fs.watch, but the watcher's dispatch() call will fire `mcp.notification`
+  // with the same pre-handshake-drop risk. Practical mitigation: daemon's
+  // envelope burst on cct-cold-start is the drain case (handled); live
+  // traffic during the sub-second handshake window is vanishingly rare.
+
+  // watch fires on rename(into-dir) events — atomic-rename from .tmp-<id>
+  // to <id>.json trips exactly that.
+  try {
+    watch(INBOX_MESSAGES_DIR, (_event, filename) => {
+      if (filename) void dispatch(String(filename))
+    })
+  } catch (err) {
+    process.stderr.write(`telegram channel (shim): fs.watch failed: ${err}\n`)
+  }
+}
+
 // Retry polling with backoff on any error. Previously only 409 was retried —
 // a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
+if (MODE !== 'shim') void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
