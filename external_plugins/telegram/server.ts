@@ -1272,20 +1272,33 @@ function runShim(): void {
   }
   dlog(`runShim: entered, legit=true, about to claim lock`)
 
+  // Test 8 fix (2026-04-27): gate ALL dispatches on handshake completion, not
+  // just the initial drain. fs.watch events that fire between watcher setup
+  // and `oninitialized` would otherwise call `mcp.notification()` against a
+  // not-yet-ready client and get dropped on the floor. We hold dispatches in
+  // a no-op state until handshake settles, then process inbox via readdirSync.
+  // SETTLE_MS is defensive padding for any micro-race in client-side listener
+  // registration after `oninitialized` fires.
+  const SETTLE_MS = 200
   let drained = false
+  let handshakeComplete = false
   const drainExisting = (): void => {
     if (drained) return
     drained = true
-    dlog(`oninitialized fired — starting drain`)
-    try {
-      const existing = readdirSync(INBOX_MESSAGES_DIR)
-        .filter(f => f.endsWith('.json') && !f.startsWith('.tmp-'))
-        .sort() // lexical sort ≈ time order via `<timestamp>-<uuid>.json` naming
-      dlog(`drain found ${existing.length} envelope(s): ${existing.join(', ')}`)
-      for (const f of existing) void dispatch(f)
-    } catch (err) {
-      dlog(`drain readdir failed: ${err}`)
-    }
+    dlog(`oninitialized fired — settling for ${SETTLE_MS}ms before drain`)
+    setTimeout(() => {
+      handshakeComplete = true
+      dlog(`settle complete, draining inbox`)
+      try {
+        const existing = readdirSync(INBOX_MESSAGES_DIR)
+          .filter(f => f.endsWith('.json') && !f.startsWith('.tmp-'))
+          .sort() // lexical sort ≈ time order via `<timestamp>-<uuid>.json` naming
+        dlog(`drain found ${existing.length} envelope(s): ${existing.join(', ')}`)
+        for (const f of existing) void dispatch(f)
+      } catch (err) {
+        dlog(`drain readdir failed: ${err}`)
+      }
+    }, SETTLE_MS)
   }
   mcp.oninitialized = drainExisting
   dlog(`oninitialized handler registered`)
@@ -1296,6 +1309,13 @@ function runShim(): void {
     // either in-flight or left over from a crashed shim — ignore.
     if (!filename.endsWith('.json')) return
     if (filename.startsWith('.tmp-')) return
+    // Test 8 gate (2026-04-27): pre-handshake fs.watch events become no-ops.
+    // The envelope stays on disk; `drainExisting` reads it after settle. This
+    // prevents `mcp.notification()` calls against a not-yet-ready client.
+    if (!handshakeComplete) {
+      dlog(`dispatch: pre-handshake, deferring ${filename} to post-handshake drain`)
+      return
+    }
     // Only the current consumer processes envelopes. Phantom shims (e.g.
     // Cursor extension-host auto-spawns) see this and return without touching
     // the file, so the real cct's shim gets clean delivery.
@@ -1345,17 +1365,14 @@ function runShim(): void {
     try { rmSync(filepath, { force: true }) } catch {}
   }
 
-  // Drain happens in `oninitialized` above (fires after MCP handshake). If we
-  // drained here synchronously, notifications would go to a not-yet-ready cct
-  // client and be silently dropped.
+  // Drain happens in `oninitialized` above (fires after MCP handshake + a
+  // brief settle delay). If we drained here synchronously, notifications would
+  // go to a not-yet-ready cct client and be silently dropped.
   //
-  // Edge case: `oninitialized` is already scheduled by the time the file is
-  // parsed, but the handshake might race our fs.watch setup below. That's
-  // fine — a new envelope arriving during the handshake window triggers
-  // fs.watch, but the watcher's dispatch() call will fire `mcp.notification`
-  // with the same pre-handshake-drop risk. Practical mitigation: daemon's
-  // envelope burst on cct-cold-start is the drain case (handled); live
-  // traffic during the sub-second handshake window is vanishingly rare.
+  // The fs.watch-handshake race is now closed by the `handshakeComplete` gate
+  // in dispatch(): pre-handshake fs.watch events become no-ops, the envelope
+  // stays on disk, and the post-handshake drain picks it up via readdirSync.
+  // No envelopes lost during the handshake window.
 
   // watch fires on rename(into-dir) events — atomic-rename from .tmp-<id>
   // to <id>.json trips exactly that.
