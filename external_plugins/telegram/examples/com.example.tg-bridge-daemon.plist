@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Example launchd plist for running the patched Telegram plugin in daemon mode
+  on macOS. Replace USERNAME and the bun/server paths to match your setup.
+
+  Install:
+    cp this file to ~/Library/LaunchAgents/com.example.tg-bridge-daemon.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.tg-bridge-daemon.plist
+
+  Verify:
+    cat ~/.claude/channels/telegram/bot.pid     # should show "daemon:<pid>"
+
+  Logs:
+    ~/Library/Logs/tg-bridge-daemon.out.log
+    ~/Library/Logs/tg-bridge-daemon.err.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.example.tg-bridge-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/.bun/bin/bun</string>
+        <string>run</string>
+        <string>/Users/USERNAME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.6/server.ts</string>
+        <string>--daemon</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>/Users/USERNAME/Library/Logs/tg-bridge-daemon.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/USERNAME/Library/Logs/tg-bridge-daemon.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TELEGRAM_STATE_DIR</key>
+        <string>/Users/USERNAME/.claude/channels/telegram</string>
+    </dict>
+</dict>
+</plist>

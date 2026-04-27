@@ -55,10 +55,10 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const INBOX_MESSAGES_DIR = join(INBOX_DIR, 'messages')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const PENDING_PERMS_FILE = join(STATE_DIR, 'pending-permissions.json')
-// Shim consumer lock (2026-04-20). Cursor's extension-host auto-spawns phantom
-// telegram plugin instances that bypass `channelsEnabled:false` (they launch
-// `bun run` directly, not via `claude`). Without this lock they'd race Juan's
-// real cct shim for envelopes; winner unlinks the file, loser's dispatch fails.
+// Shim consumer lock. Cursor's extension-host auto-spawns phantom telegram
+// plugin instances that bypass `channelsEnabled:false` (they launch `bun run`
+// directly, not via `claude`). Without this lock they'd race the user's real
+// cct shim for envelopes; winner unlinks the file, loser's dispatch fails.
 // Last-writer-wins: newest shim claims on startup, older shims yield on
 // dispatch. Stale PIDs auto-recovered.
 const SHIM_LOCK_FILE = join(STATE_DIR, 'shim.lock')
